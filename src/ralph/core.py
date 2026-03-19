@@ -9,6 +9,7 @@ All filesystem state lives under ~/.ralph/loops/<loop-id>/.
 
 import hashlib
 import json
+import os
 import shutil
 import signal
 import subprocess
@@ -270,6 +271,78 @@ def delete_loop(loop_id: str) -> None:
     d = loop_dir(loop_id)
     if d.exists():
         shutil.rmtree(d)
+
+
+# ─── Daemon PID Management ──────────────────────────────────────────────────
+# When `ralph run --daemon` spawns a background process, the PID is stored in
+# daemon.pid so we can check status and kill it later.
+
+
+def write_pid(loop_id: str, pid: int) -> None:
+    """Write the daemon PID to a file."""
+    (loop_dir(loop_id) / "daemon.pid").write_text(str(pid))
+
+
+def read_pid(loop_id: str) -> int | None:
+    """Read the daemon PID if it exists and the process is still alive.
+
+    Returns None if no PID file exists, the PID is invalid, or the process
+    is no longer running. Cleans up stale PID files automatically.
+    """
+    pid_file = loop_dir(loop_id) / "daemon.pid"
+    if not pid_file.exists():
+        return None
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)  # Signal 0 = check if process exists, don't kill it
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        # PID file is stale or corrupt — clean it up
+        pid_file.unlink(missing_ok=True)
+        return None
+
+
+def remove_pid(loop_id: str) -> None:
+    """Remove the daemon PID file."""
+    (loop_dir(loop_id) / "daemon.pid").unlink(missing_ok=True)
+
+
+def kill_daemon(loop_id: str) -> bool:
+    """Kill the daemon process for a loop. Returns True if a process was killed."""
+    pid = read_pid(loop_id)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        remove_pid(loop_id)
+        return True
+    except ProcessLookupError:
+        remove_pid(loop_id)
+        return False
+
+
+def daemonize_loop(loop_id: str, delay: int) -> int:
+    """Spawn a detached background process running the loop.
+
+    Uses the current Python interpreter to run `ralph _run-loop <id>`,
+    detached from the terminal via start_new_session=True. This survives
+    SSH disconnect, terminal close, etc.
+
+    Returns the daemon PID.
+    """
+    log_path = loop_dir(loop_id) / "daemon.log"
+
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "ralph", "_run-loop", loop_id,
+             "--delay", str(delay)],
+            stdout=log,
+            stderr=log,
+            start_new_session=True,  # Detach from terminal session
+        )
+
+    write_pid(loop_id, proc.pid)
+    return proc.pid
 
 
 # ─── Provider Management ─────────────────────────────────────────────────────

@@ -15,13 +15,17 @@ from ralph import __version__
 from ralph.core import (
     IterationResult,
     create_loop,
+    daemonize_loop,
     delete_loop,
     execute_one_iteration,
     install_cron,
+    kill_daemon,
     list_loops,
     loop_dir,
+    read_pid,
     read_state,
     remove_cron,
+    remove_pid,
     run_foreground_loop,
     validate_provider,
     write_state,
@@ -145,8 +149,11 @@ def run(
     workdir: Path = typer.Option(
         ".", "--workdir", "-w", help="Working directory for the agent",
     ),
+    daemon: bool = typer.Option(
+        False, "--daemon", help="Run in background (survives SSH disconnect)",
+    ),
 ) -> None:
-    """Start a foreground Ralph loop with constant delay between iterations."""
+    """Start a Ralph loop with constant delay between iterations."""
     task = _resolve_prompt(prompt, prompt_file)
     loop_name = _auto_name(name, task)
 
@@ -170,8 +177,19 @@ def run(
     console.print(f"[bold]Created loop:[/bold] {state.id}")
     console.print(f"  Provider: {provider} | Model: {model or '(default)'} | Max: {max_iter}")
     console.print(f"  Delay: {delay}s | Workdir: {state.workdir}")
-    console.print()
 
+    if daemon:
+        pid = daemonize_loop(state.id, delay)
+        console.print(f"  Daemon PID: {pid}")
+        console.print()
+        console.print(
+            f"Loop running in background."
+            f" Use [bold]ralph show {state.id}[/bold] to check status."
+        )
+        console.print(f"Use [bold]ralph remove {state.id}[/bold] to stop.")
+        return
+
+    console.print()
     final = run_foreground_loop(state.id, delay, on_iteration=_print_iteration)
 
     console.print()
@@ -220,6 +238,18 @@ def schedule(
     console.print(f"  Schedule: {cron}")
     console.print(f"  Provider: {provider} | Model: {model or '(default)'} | Max: {max_iter}")
     console.print(f"  Workdir: {state.workdir}")
+
+
+@app.command("_run-loop", hidden=True)
+def _run_loop_cmd(
+    loop_id: str = typer.Argument(...),
+    delay: int = typer.Option(5, "--delay"),
+) -> None:
+    """Internal: run a loop in the foreground. Used by --daemon subprocess."""
+    try:
+        run_foreground_loop(loop_id, delay)
+    finally:
+        remove_pid(loop_id)
 
 
 @app.command()
@@ -303,6 +333,9 @@ def show(
     console.print(f"  Workdir:    {state.workdir}")
     console.print(f"  Iteration:  {state.iteration}/{state.max_iterations}")
     console.print(f"  Schedule:   {state.cron_expression or '(foreground)'}")
+    pid = read_pid(loop_id)
+    if pid is not None:
+        console.print(f"  Daemon:     [green]running (PID {pid})[/green]")
     console.print(f"  Created:    {state.created_at}")
     console.print(f"  Last run:   {_relative_time(state.last_run_at)}")
 
@@ -344,7 +377,11 @@ def remove(
         console.print(f"[red]Loop not found: {loop_id}[/red]")
         raise typer.Exit(1)
 
-    # Always remove cron entry if one exists
+    # Kill daemon process if running
+    if kill_daemon(loop_id):
+        console.print(f"Stopped daemon for {loop_id}")
+
+    # Remove cron entry if one exists
     if state.cron_expression:
         remove_cron(loop_id)
         console.print(f"Removed cron job for {loop_id}")
