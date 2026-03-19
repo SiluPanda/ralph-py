@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "ralph-py"
 version = "0.1.0"
 description = "Minimal CLI for orchestrating Ralph loops across coding agents"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 keywords = ["ralph", "loop", "ai", "coding-agent", "cli", "orchestration"]
