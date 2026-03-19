@@ -230,7 +230,7 @@ def once(
     try:
         result = execute_one_iteration(loop_id)
     except FileNotFoundError:
-        console.print(f"Loop not found: {loop_id}", err=True)
+        console.print(f"[red]Loop not found: {loop_id}[/red]")
         raise typer.Exit(1)
 
     s = result.state
