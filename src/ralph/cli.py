@@ -4,6 +4,8 @@ Thin layer over core.py — validates inputs, calls core functions, formats outp
 All commands are defined here using Typer.
 """
 
+import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from ralph.core import (
     delete_loop,
     execute_one_iteration,
     install_cron,
+    is_loop_process_alive,
     kill_daemon,
     list_loops,
     loop_dir,
@@ -27,6 +30,7 @@ from ralph.core import (
     remove_cron,
     remove_pid,
     run_foreground_loop,
+    sorted_log_files,
     validate_provider,
     write_state,
 )
@@ -40,6 +44,23 @@ console = Console()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _read_state_or_exit(loop_id: str):
+    """Read loop state, exiting with a user-friendly error on failure."""
+    try:
+        return read_state(loop_id)
+    except FileNotFoundError:
+        console.print(f"[red]Loop not found: {loop_id}[/red]")
+        raise typer.Exit(1)
+    except PermissionError:
+        console.print(f"[red]Permission denied reading loop {loop_id}[/red]")
+        console.print(f"[red]Check permissions: {loop_dir(loop_id)}[/red]")
+        raise typer.Exit(1)
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+        console.print(f"[red]Corrupt state for loop {loop_id}: {e}[/red]")
+        console.print(f"[red]Fix or delete: {loop_dir(loop_id)}[/red]")
+        raise typer.Exit(1)
 
 
 def _resolve_prompt(prompt: str, prompt_file: Path | None) -> str:
@@ -179,7 +200,14 @@ def run(
     console.print(f"  Delay: {delay}s | Workdir: {state.workdir}")
 
     if daemon:
-        pid = daemonize_loop(state.id, delay)
+        try:
+            pid = daemonize_loop(state.id, delay)
+        except RuntimeError as e:
+            # Mark loop as failed so it doesn't appear stuck "running" forever
+            state.status = "failed"
+            write_state(state)
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
         console.print(f"  Daemon PID: {pid}")
         console.print()
         console.print(
@@ -190,7 +218,16 @@ def run(
         return
 
     console.print()
-    final = run_foreground_loop(state.id, delay, on_iteration=_print_iteration)
+    try:
+        final = run_foreground_loop(state.id, delay, on_iteration=_print_iteration)
+    except Exception as e:
+        console.print(f"\n[red]Loop crashed: {e}[/red]")
+        try:
+            final = read_state(state.id)
+            console.print(f"[bold]Loop {final.status}[/bold] after {final.iteration} iterations.")
+        except Exception:
+            pass
+        raise typer.Exit(1)
 
     console.print()
     console.print(f"[bold]Loop {final.status}[/bold] after {final.iteration} iterations.")
@@ -232,7 +269,17 @@ def schedule(
         cron_expression=cron,
     )
 
-    install_cron(state.id, cron)
+    try:
+        install_cron(state.id, cron)
+    except FileNotFoundError:
+        delete_loop(state.id)
+        console.print("[red]'crontab' not found. System cron is required for scheduling.[/red]")
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError as e:
+        delete_loop(state.id)
+        console.print(f"[red]Failed to install cron job: {e}[/red]")
+        console.print("[red]Check your cron expression is valid.[/red]")
+        raise typer.Exit(1)
 
     console.print(f"[bold]Scheduled loop:[/bold] {state.id}")
     console.print(f"  Schedule: {cron}")
@@ -248,6 +295,16 @@ def _run_loop_cmd(
     """Internal: run a loop in the foreground. Used by --daemon subprocess."""
     try:
         run_foreground_loop(loop_id, delay)
+    except Exception:
+        # Daemon crashed — mark loop as failed so it doesn't appear stuck "running"
+        try:
+            state = read_state(loop_id)
+            if state.status == "running":
+                state.status = "failed"
+                write_state(state)
+        except Exception:
+            pass  # Loop directory may already be deleted
+        raise
     finally:
         remove_pid(loop_id)
 
@@ -257,17 +314,24 @@ def once(
     loop_id: str = typer.Argument(..., help="Loop ID to run one iteration of"),
 ) -> None:
     """Run a single iteration of a loop (used by cron, or manually)."""
+    _read_state_or_exit(loop_id)  # Validate loop exists and state is readable
     try:
         result = execute_one_iteration(loop_id)
-    except FileNotFoundError:
-        console.print(f"[red]Loop not found: {loop_id}[/red]")
+    except Exception as e:
+        console.print(f"[red]Error running iteration for {loop_id}: {e}[/red]")
         raise typer.Exit(1)
 
     s = result.state
     if s.status == "completed":
         console.print(f"Loop {loop_id}: COMPLETED (iteration {s.iteration})")
+    elif s.status == "failed":
+        console.print(f"[red]Loop {loop_id}: FAILED at iteration {s.iteration}[/red]")
+        if result.output.strip():
+            console.print(f"  {result.output.strip().splitlines()[-1]}")
     elif s.status == "stopped":
         console.print(f"Loop {loop_id}: STOPPED at iteration {s.iteration}/{s.max_iterations}")
+    elif result.exit_code == -1:
+        console.print(f"Loop {loop_id}: skipped (status: {s.status})")
     else:
         console.print(f"Loop {loop_id}: iteration {s.iteration} done (exit {result.exit_code})")
 
@@ -299,12 +363,23 @@ def list_cmd() -> None:
 
     for state in loops:
         color = status_colors.get(state.status, "white")
+
+        # Determine schedule column: cron, daemon, or foreground
+        if state.cron_expression:
+            schedule_label = state.cron_expression
+        elif read_pid(state.id) is not None:
+            schedule_label = "(daemon)"
+        elif (loop_dir(state.id) / "daemon.log").exists():
+            schedule_label = "(daemon, stopped)"
+        else:
+            schedule_label = "(foreground)"
+
         table.add_row(
             state.id,
             state.name[:30],
             f"[{color}]{state.status}[/{color}]",
             f"{state.iteration}/{state.max_iterations}",
-            state.cron_expression or "(foreground)",
+            schedule_label,
             _relative_time(state.last_run_at),
         )
 
@@ -316,13 +391,28 @@ def show(
     loop_id: str = typer.Argument(..., help="Loop ID"),
 ) -> None:
     """Show full details of a loop: config, memory, and latest log."""
-    try:
-        state = read_state(loop_id)
-    except FileNotFoundError:
-        console.print(f"[red]Loop not found: {loop_id}[/red]")
-        raise typer.Exit(1)
+    state = _read_state_or_exit(loop_id)
 
     d = loop_dir(loop_id)
+
+    # Detect stale loops: check if the runner process is still alive.
+    had_pid_file = (d / "daemon.pid").exists()
+    alive = is_loop_process_alive(loop_id)
+    pid = read_pid(loop_id)
+    if state.status == "running" and state.cron_expression is None and not alive:
+        if had_pid_file or state.last_run_at is not None:
+            state.status = "stopped"
+            write_state(state)
+
+    # Determine schedule label
+    if state.cron_expression:
+        schedule_label = state.cron_expression
+    elif pid is not None:
+        schedule_label = "(daemon)"
+    elif (d / "daemon.log").exists():
+        schedule_label = "(daemon, stopped)"
+    else:
+        schedule_label = "(foreground)"
 
     # Loop metadata
     console.print(f"[bold]Loop: {state.id}[/bold]")
@@ -332,8 +422,7 @@ def show(
     console.print(f"  Model:      {state.model or '(default)'}")
     console.print(f"  Workdir:    {state.workdir}")
     console.print(f"  Iteration:  {state.iteration}/{state.max_iterations}")
-    console.print(f"  Schedule:   {state.cron_expression or '(foreground)'}")
-    pid = read_pid(loop_id)
+    console.print(f"  Schedule:   {schedule_label}")
     if pid is not None:
         console.print(f"  Daemon:     [green]running (PID {pid})[/green]")
     console.print(f"  Created:    {state.created_at}")
@@ -350,17 +439,25 @@ def show(
                 console.print(f"  {line}")
 
     # Latest log tail (last 10 lines)
-    logs_dir = d / "logs"
-    if logs_dir.exists():
-        log_files = sorted(logs_dir.glob("*.log"))
-        if log_files:
-            latest = log_files[-1]
-            content = latest.read_text().strip()
-            if content:
-                console.print()
-                console.print(f"[bold]Latest log ({latest.name}, last 10 lines):[/bold]")
-                for line in content.splitlines()[-10:]:
-                    console.print(f"  {line}")
+    log_files = sorted_log_files(loop_id)
+    if log_files:
+        latest = log_files[-1]
+        content = latest.read_text().strip()
+        if content:
+            console.print()
+            console.print(f"[bold]Latest log ({latest.name}, last 10 lines):[/bold]")
+            for line in content.splitlines()[-10:]:
+                console.print(f"  {line}")
+
+    # Daemon log (useful for debugging daemon startup failures)
+    daemon_log = d / "daemon.log"
+    if daemon_log.exists():
+        content = daemon_log.read_text().strip()
+        if content:
+            console.print()
+            console.print("[bold]Daemon log (last 10 lines):[/bold]")
+            for line in content.splitlines()[-10:]:
+                console.print(f"  {line}")
 
 
 @app.command()
@@ -371,28 +468,82 @@ def remove(
     ),
 ) -> None:
     """Remove a loop: stop cron job, optionally delete all files."""
-    try:
-        state = read_state(loop_id)
-    except FileNotFoundError:
-        console.print(f"[red]Loop not found: {loop_id}[/red]")
-        raise typer.Exit(1)
+    state = _read_state_or_exit(loop_id)
 
     # Kill daemon process if running
-    if kill_daemon(loop_id):
+    try:
+        daemon_was_killed = kill_daemon(loop_id)
+    except Exception as e:
+        console.print(f"[yellow]Warning: error stopping daemon: {e}[/yellow]")
+        daemon_was_killed = False
+    if daemon_was_killed:
         console.print(f"Stopped daemon for {loop_id}")
 
     # Remove cron entry if one exists
     if state.cron_expression:
-        remove_cron(loop_id)
-        console.print(f"Removed cron job for {loop_id}")
+        try:
+            remove_cron(loop_id)
+            console.print(f"Removed cron job for {loop_id}")
+        except Exception as e:
+            console.print(f"[yellow]Warning: could not remove cron job: {e}[/yellow]")
 
     if keep_files:
-        state.status = "stopped"
+        # Re-read state — the daemon may have updated iteration/status before dying
+        if daemon_was_killed:
+            try:
+                state = read_state(loop_id)
+            except Exception:
+                pass  # Use original state if re-read fails
+        # Only overwrite status if the loop is still running — preserve
+        # "completed" and "failed" as they carry meaningful history.
+        if state.status == "running":
+            state.status = "stopped"
         write_state(state)
         console.print(f"Loop {loop_id} stopped (files preserved at {loop_dir(loop_id)})")
     else:
         delete_loop(loop_id)
         console.print(f"Loop {loop_id} removed.")
+
+
+@app.command()
+def stop(
+    loop_id: str = typer.Argument(..., help="Loop ID to stop"),
+) -> None:
+    """Stop a running loop (preserves files for inspection)."""
+    state = _read_state_or_exit(loop_id)
+
+    if state.status != "running":
+        console.print(f"Loop {loop_id} is already {state.status}.")
+        return
+
+    # Kill daemon/foreground process if running
+    try:
+        daemon_was_killed = kill_daemon(loop_id)
+    except Exception as e:
+        console.print(f"[yellow]Warning: error stopping process: {e}[/yellow]")
+        daemon_was_killed = False
+    if daemon_was_killed:
+        console.print(f"Stopped process for {loop_id}")
+
+    # Remove cron entry if one exists
+    if state.cron_expression:
+        try:
+            remove_cron(loop_id)
+            console.print(f"Removed cron job for {loop_id}")
+        except Exception as e:
+            console.print(f"[yellow]Warning: could not remove cron job: {e}[/yellow]")
+
+    # Re-read state — the daemon may have updated iteration/status before dying
+    if daemon_was_killed:
+        try:
+            state = read_state(loop_id)
+        except Exception:
+            pass
+
+    if state.status == "running":
+        state.status = "stopped"
+    write_state(state)
+    console.print(f"Loop {loop_id} stopped (files at {loop_dir(loop_id)})")
 
 
 @app.command()
@@ -404,11 +555,7 @@ def logs(
     tail: int = typer.Option(0, "--tail", "-t", help="Show only last N lines (0 = all)"),
 ) -> None:
     """View the log for a specific iteration (defaults to latest)."""
-    try:
-        read_state(loop_id)  # Validate the loop exists
-    except FileNotFoundError:
-        console.print(f"[red]Loop not found: {loop_id}[/red]")
-        raise typer.Exit(1)
+    _read_state_or_exit(loop_id)  # Validate loop exists and state is readable
 
     logs_dir = loop_dir(loop_id) / "logs"
 
@@ -416,8 +563,8 @@ def logs(
         # Specific iteration requested
         log_file = logs_dir / f"{iteration:03d}.log"
     else:
-        # Default to the latest log file
-        log_files = sorted(logs_dir.glob("*.log"))
+        # Default to the latest log file (numeric sort for correctness past 999)
+        log_files = sorted_log_files(loop_id)
         if not log_files:
             console.print("No logs yet.")
             return
