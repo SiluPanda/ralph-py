@@ -322,7 +322,10 @@ def once(
         raise typer.Exit(1)
 
     s = result.state
-    if s.status == "completed":
+    if result.exit_code == -1:
+        # Iteration was skipped (loop not running, or lock held by another process)
+        console.print(f"Loop {loop_id}: skipped (status: {s.status})")
+    elif s.status == "completed":
         console.print(f"Loop {loop_id}: COMPLETED (iteration {s.iteration})")
     elif s.status == "failed":
         console.print(f"[red]Loop {loop_id}: FAILED at iteration {s.iteration}[/red]")
@@ -330,8 +333,6 @@ def once(
             console.print(f"  {result.output.strip().splitlines()[-1]}")
     elif s.status == "stopped":
         console.print(f"Loop {loop_id}: STOPPED at iteration {s.iteration}/{s.max_iterations}")
-    elif result.exit_code == -1:
-        console.print(f"Loop {loop_id}: skipped (status: {s.status})")
     else:
         console.print(f"Loop {loop_id}: iteration {s.iteration} done (exit {result.exit_code})")
 

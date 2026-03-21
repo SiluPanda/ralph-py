@@ -459,14 +459,14 @@ def test_once_reports_failed_status(mock_popen):
 
 
 def test_once_reports_stopped_loop():
-    """once should say STOPPED for a stopped loop, not 'done (exit -1)'."""
+    """once should say 'skipped' for a stopped loop, not 'done (exit -1)'."""
     state = create_loop("stopped loop", "task", "claude", "", "/tmp", 10, 5)
     state.status = "stopped"
     write_state(state)
 
     result = runner.invoke(app, ["once", state.id])
     assert result.exit_code == 0
-    assert "STOPPED" in result.output
+    assert "skipped" in result.output
 
 
 # ─── Remove proceeds even if cron removal fails ──────────────────────────────
