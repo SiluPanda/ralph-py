@@ -4,11 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ralph-py"
-version = "0.3.0"
+version = "0.4.0"
 description = "Minimal CLI for orchestrating Ralph loops across coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+authors = [
+    { name = "SiluPanda" },
+]
 keywords = ["ralph", "loop", "ai", "coding-agent", "cli", "orchestration"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -24,6 +27,11 @@ classifiers = [
 dependencies = [
     "typer>=0.9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/SiluPanda/ralph-py"
+Repository = "https://github.com/SiluPanda/ralph-py"
+Issues = "https://github.com/SiluPanda/ralph-py/issues"
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]

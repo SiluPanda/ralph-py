@@ -77,7 +77,7 @@ ralph run "add test coverage" --provider aider --model claude-sonnet-4-20250514
 
 ### `ralph run`
 
-Start a foreground loop. The agent runs repeatedly with a configurable delay between iterations.
+Start a loop. Runs in the foreground by default, or as a background daemon with `--daemon`.
 
 ```bash
 ralph run "implement auth feature" [options]
@@ -92,8 +92,17 @@ ralph run "implement auth feature" [options]
 | `--prompt-file` | `-f` | | Read prompt from a file |
 | `--name` | | *(auto)* | Human-readable loop name |
 | `--workdir` | `-w` | `.` | Working directory for the agent |
+| `--daemon` | | `false` | Run in background (survives SSH disconnect) |
 
-Ctrl+C gracefully stops — the current iteration finishes, state is saved.
+Ctrl+C gracefully stops foreground loops — the current iteration finishes, state is saved.
+
+#### Daemon mode
+
+```bash
+ralph run "implement auth" --daemon
+```
+
+The `--daemon` flag spawns a detached background process that survives SSH disconnects and terminal closes. Use `ralph show <loop-id>` to check progress and `ralph stop <loop-id>` to stop it.
 
 ### `ralph schedule`
 
@@ -138,6 +147,16 @@ ralph logs <loop-id>                # latest iteration
 ralph logs <loop-id> --iter 3       # specific iteration
 ralph logs <loop-id> --tail 20      # last 20 lines
 ```
+
+### `ralph stop <loop-id>`
+
+Stop a running loop without deleting any files. Works for foreground, daemon, and cron loops.
+
+```bash
+ralph stop <loop-id>
+```
+
+This kills the process (if running), removes any cron entry, and sets the status to `stopped`. All files (logs, memory, state) are preserved for inspection.
 
 ### `ralph remove <loop-id>`
 
@@ -205,15 +224,16 @@ All state lives under `~/.ralph/`:
 
 No databases. No daemon. Just files.
 
-## Foreground vs. scheduled
+## Foreground vs. daemon vs. scheduled
 
-| | `ralph run` | `ralph schedule` |
-|---|---|---|
-| Process | Foreground, needs a terminal | No process — cron manages it |
-| Survives reboot | No | Yes |
-| Timing | Fixed delay between iterations | Cron expression |
-| Output | Streamed to terminal | Written to log files |
-| Best for | Active development | Overnight/periodic tasks |
+| | `ralph run` | `ralph run --daemon` | `ralph schedule` |
+|---|---|---|---|
+| Process | Foreground, needs a terminal | Background, detached | No process — cron manages it |
+| Survives terminal close | No | Yes | Yes |
+| Survives reboot | No | No | Yes |
+| Timing | Fixed delay between iterations | Fixed delay between iterations | Cron expression |
+| Output | Streamed to terminal | Written to log files | Written to log files |
+| Best for | Active development | Long tasks over SSH | Overnight/periodic tasks |
 
 ## Installation
 

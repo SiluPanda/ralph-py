@@ -1,3 +1,3 @@
 """ralph-py: Minimal CLI for orchestrating Ralph loops across coding agents."""
 
-__version__: str = "0.3.0"
+__version__: str = "0.4.0"
